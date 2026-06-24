@@ -1,0 +1,5 @@
+# Binarios compilados
+launcher/launcher
+x11_client/x11_client
+ia_learner/ia_learner
+*.o
