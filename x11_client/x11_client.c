@@ -262,15 +262,21 @@ int main(int argc, char *argv[])
         /* Escape: cerrar */
         if (ks == XK_Escape) { running = 0; break; }
 
-        /* Enter: enviar oración */
+        /* Enter: marcar fin de oración */
         if (ks == XK_Return || ks == XK_KP_Enter) {
+            /* si quedó una palabra sin espacio al final, enviarla primero */
             if (slen > 0 && g_ctx.sock_fd >= 0) {
                 char msg[MSG_MAX_LEN];
-                snprintf(msg, sizeof(msg), "%s ", MSG_PREFIX_LINE);
+                snprintf(msg, sizeof(msg), "%s ", MSG_PREFIX_WORD);
                 strncat(msg, sentence, sizeof(msg) - strlen(msg) - 1);
                 queue_push(&g_ctx.queue, msg);
-                printf("[x11_client-%d] Oración: %s\n", g_ctx.window_id, sentence);
+                printf("[x11_client-%d] Palabra final: %s\n",
+                       g_ctx.window_id, sentence);
             }
+            /* señal de fin de oración al IALearner */
+            if (g_ctx.sock_fd >= 0)
+                queue_push(&g_ctx.queue, MSG_PREFIX_NEWLINE);
+            printf("[x11_client-%d] --- fin de oración ---\n", g_ctx.window_id);
             memset(sentence, 0, sizeof(sentence));
             slen = 0;
             XClearWindow(dpy, win);
@@ -289,7 +295,22 @@ int main(int argc, char *argv[])
 
         /* carácter imprimible */
         if (nc > 0 && (unsigned char)buf[0] >= 32 && (unsigned char)buf[0] < 127) {
-            if (slen + nc < (int)sizeof(sentence) - 1) {
+            /* Espacio: enviar la palabra acumulada y resetear buffer */
+            if (buf[0] == ' ') {
+                if (slen > 0 && g_ctx.sock_fd >= 0) {
+                    char msg[MSG_MAX_LEN];
+                    snprintf(msg, sizeof(msg), "%s ", MSG_PREFIX_WORD);
+                    strncat(msg, sentence, sizeof(msg) - strlen(msg) - 1);
+                    queue_push(&g_ctx.queue, msg);
+                    printf("[x11_client-%d] Palabra: %s\n",
+                           g_ctx.window_id, sentence);
+                }
+                memset(sentence, 0, sizeof(sentence));
+                slen = 0;
+                XClearWindow(dpy, win);
+                draw_hint(dpy, win, gc, (int)wid);
+            } else if (slen + nc < (int)sizeof(sentence) - 1) {
+                /* acumular letra en el buffer */
                 memcpy(sentence + slen, buf, nc);
                 slen += nc;
                 sentence[slen] = '\0';
@@ -300,12 +321,14 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* enviar oración parcial si quedó texto */
+    /* enviar palabra parcial si quedó texto al cerrar */
     if (slen > 0 && g_ctx.sock_fd >= 0) {
         char msg[MSG_MAX_LEN];
-        snprintf(msg, sizeof(msg), "%s ", MSG_PREFIX_LINE);
+        snprintf(msg, sizeof(msg), "%s ", MSG_PREFIX_WORD);
         strncat(msg, sentence, sizeof(msg) - strlen(msg) - 1);
         queue_push(&g_ctx.queue, msg);
+        /* marcar fin de oración implícito al cerrar */
+        queue_push(&g_ctx.queue, MSG_PREFIX_NEWLINE);
     }
 
     /* ORDEN CRÍTICO:

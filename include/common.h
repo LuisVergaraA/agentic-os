@@ -37,6 +37,8 @@
 #define MSG_PREFIX_ID         "ID"     /* primer mensaje al conectar    */
 #define MSG_PREFIX_LINE       "LINE"   /* una oración completa          */
 #define MSG_PREFIX_EOF        "EOF"    /* la ventana se cerró           */
+#define MSG_PREFIX_WORD       "WORD"   /* una palabra individual        */
+#define MSG_PREFIX_NEWLINE    "NL"     /* fin de oración (Enter)        */
 #define MSG_PREFIX_TOTAL      "TOTAL"  /* launcher avisa cuántas ventanas habrá */
 
 /* ════════════════════════════════════════════════════════════════
