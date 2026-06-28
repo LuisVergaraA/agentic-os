@@ -44,16 +44,16 @@ static volatile sig_atomic_t g_total_expected = 0;  /* declarado por TOTAL */
  * DICCIONARIOS BAG-OF-WORDS
  * ═══════════════════════════════════════════════════════════════ */
 static const char *DICT_EMAIL[] = {
-    "thank","please","regards","meeting","attached",
-    "information","update","schedule","team","project", NULL
+    "gracias","favor","saludos","reunion","adjunto",
+    "informacion","actualizar","horario","equipo","proyecto", NULL
 };
 static const char *DICT_ARTICLE[] = {
-    "data","analysis","results","method","study",
-    "model","research","system","significant","effect", NULL
+    "datos","analisis","resultados","metodo","estudio",
+    "modelo","investigacion","sistema","significativo","efecto", NULL
 };
 static const char *DICT_REPORT[] = {
-    "system","data","network","security","application",
-    "server","user","performance","service","infrastructure", NULL
+    "sistema","datos","red","seguridad","aplicacion",
+    "servidor","usuario","rendimiento","servicio","infraestructura", NULL
 };
 static const char **DICTIONARIES[NUM_DOC_CLASSES] = {
     DICT_EMAIL, DICT_ARTICLE, DICT_REPORT
@@ -115,19 +115,6 @@ static int bow_get_freq(const BagOfWords *b, const char *word)
     return 0;
 }
 
-static void bow_process_sentence(BagOfWords *b, const char *sentence)
-{
-    if (!sentence) return;
-    char buf[MSG_MAX_LEN];
-    strncpy(buf, sentence, MSG_MAX_LEN - 1);
-    buf[MSG_MAX_LEN - 1] = '\0';
-    char *sp = NULL;
-    char *tok = strtok_r(buf, " \t\n\r,.;:!?\"'()[]{}\\/-", &sp);
-    while (tok) {
-        if (strlen(tok) > 0) bow_add_word(b, tok);
-        tok = strtok_r(NULL, " \t\n\r,.;:!?\"'()[]{}\\/-", &sp);
-    }
-}
 
 /* ═══════════════════════════════════════════════════════════════
  * TDA: DOCUMENTO
@@ -137,6 +124,7 @@ typedef struct {
     BagOfWords      bow;
     DocClass        doc_class;
     int             in_use;
+    char            current_line[MAX_SENTENCE_LEN]; /* oración en construcción */
     pthread_mutex_t mutex;
 } DocRecord;
 
@@ -173,9 +161,10 @@ static DocRecord *doc_table_register(DocTable *t, int window_id)
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (!t->docs[i].in_use) {
             slot = &t->docs[i];
-            slot->in_use    = 1;
-            slot->window_id = window_id;
-            slot->doc_class = DOC_UNKNOWN;
+            slot->in_use         = 1;
+            slot->window_id      = window_id;
+            slot->doc_class      = DOC_UNKNOWN;
+            slot->current_line[0] = '\0';
             bow_init(&slot->bow);
             t->count++;
             /* despertar al clasificador: ya hay al menos 1 doc */
@@ -414,17 +403,33 @@ static void *connection_thread(void *arg)
                 PRINT_UNLOCK();
             }
 
-            /* ── LINE: oración de texto ── */
-            else if (strncmp(line, MSG_PREFIX_LINE,
-                             strlen(MSG_PREFIX_LINE)) == 0) {
-                const char *text = line + strlen(MSG_PREFIX_LINE) + 1;
-                if (doc) {
+            /* ── WORD: palabra enviada al presionar espacio ── */
+            else if (strncmp(line, MSG_PREFIX_WORD,
+                             strlen(MSG_PREFIX_WORD)) == 0) {
+                const char *word = line + strlen(MSG_PREFIX_WORD) + 1;
+                if (doc != NULL && word[0] != '\0') {
                     pthread_mutex_lock(&doc->mutex);
-                    bow_process_sentence(&doc->bow, text);
+                    bow_add_word(&doc->bow, word);
+                    if (doc->current_line[0] != '\0' &&
+                        strlen(doc->current_line) + 1 < MAX_SENTENCE_LEN)
+                        strcat(doc->current_line, " ");
+                    if (strlen(doc->current_line) + strlen(word) < MAX_SENTENCE_LEN)
+                        strcat(doc->current_line, word);
                     pthread_mutex_unlock(&doc->mutex);
+                }
+            }
+
+            /* ── NL: fin de oración (usuario presionó Enter) ── */
+            else if (strncmp(line, MSG_PREFIX_NEWLINE,
+                             strlen(MSG_PREFIX_NEWLINE)) == 0) {
+                if (doc != NULL) {
+                    pthread_mutex_lock(&doc->mutex);
                     PRINT_LOCK();
-                    printf("[IALearner] Ventana %d: %s\n", window_id, text);
+                    printf("[IALearner] Ventana %d oración: %s\n",
+                           window_id, doc->current_line);
                     PRINT_UNLOCK();
+                    doc->current_line[0] = '\0';
+                    pthread_mutex_unlock(&doc->mutex);
                 }
             }
 
