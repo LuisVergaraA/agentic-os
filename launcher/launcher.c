@@ -38,6 +38,11 @@ static ManagedProcess g_procs[MAX_WINDOWS];
 static volatile sig_atomic_t g_proc_count = 0;
 static volatile sig_atomic_t g_finished   = 0;
 
+/* Guardados una vez validados en main(), reusados por launch_more_windows() */
+static const char *g_host      = NULL;
+static int         g_port      = 0;
+static const char *g_client_bin = NULL;
+
 /* ════════════════════════════════════════════════════════════════
  * HANDLER DE SIGCHLD
  * Loop obligatorio: si dos hijos mueren casi a la vez, las señales
@@ -167,15 +172,30 @@ static void print_status(void)
  * CIERRE LIMPIO DE TODOS LOS HIJOS
  * SIGTERM primero; SIGKILL tras 2 s si siguen vivos.
  * ════════════════════════════════════════════════════════════════ */
-static void shutdown_all(void)
+/*
+ * Envía SIGTERM (y SIGKILL si hace falta) a todos los procesos que
+ * sigan CORRIENDO. No sale del programa: solo mata ventanas.
+ * Reusable tanto por la opción de menú "cerrar ventanas" como por
+ * shutdown_all() al salir del launcher.
+ */
+static void terminate_all_children(void)
 {
-    printf("[Launcher] Enviando SIGTERM a todos los procesos...\n");
+    int vivos = 0;
+    for (int i = 0; i < g_proc_count; i++)
+        if (g_procs[i].state == PROC_RUNNING) vivos++;
 
+    if (vivos == 0) {
+        printf("[Launcher] No hay ventanas activas para cerrar.\n");
+        return;
+    }
+
+    printf("[Launcher] Enviando SIGTERM a %d ventana(s)...\n", vivos);
     for (int i = 0; i < g_proc_count; i++)
         if (g_procs[i].state == PROC_RUNNING)
             kill(g_procs[i].pid, SIGTERM);
 
-    /* Esperar hasta 2 s en pasos de 100 ms */
+    /* Esperar hasta 2 s en pasos de 100 ms.
+     * Los estados se actualizan solos vía sigchld_handler. */
     for (int t = 0; t < 20; t++) {
         usleep(100000);
         int todos_ok = 1;
@@ -201,7 +221,53 @@ static void shutdown_all(void)
     while (waitpid(-1, &status, WNOHANG) > 0)
         ;
 
+    printf("[Launcher] Ventanas cerradas.\n");
+}
+
+static void shutdown_all(void)
+{
+    terminate_all_children();
     printf("[Launcher] Todos los procesos terminados.\n");
+}
+
+/* ════════════════════════════════════════════════════════════════
+ * LANZAR N VENTANAS ADICIONALES
+ * Continúa la numeración de window_id donde quedó (nunca se reutiliza
+ * un ID ya usado). Reenvía TOTAL a IALearner con el acumulado
+ * (viejas + nuevas) para que el clasificador reaccione a esta ronda.
+ * ════════════════════════════════════════════════════════════════ */
+static void launch_more_windows(int n)
+{
+    if (n < 1) return;
+
+    if (g_proc_count + n > MAX_WINDOWS) {
+        fprintf(stderr,
+            "[Launcher] No se puede: %d + %d supera el máximo de %d ventanas.\n",
+            (int)g_proc_count, n, MAX_WINDOWS);
+        return;
+    }
+
+    int new_total = (int)g_proc_count + n;   /* acumulado: viejas + nuevas */
+    if (notify_total(g_host, g_port, new_total) < 0)
+        fprintf(stderr, "[Launcher] ADVERTENCIA: sin conexión a IALearner\n");
+
+    for (int i = 0; i < n; i++) {
+        int wid = (int)g_proc_count + 1;
+        pid_t pid = launch_client(wid, g_host, g_port, g_client_bin);
+        if (pid < 0) {
+            fprintf(stderr, "[Launcher] Fallo al lanzar ventana %d\n", wid);
+            continue;
+        }
+        int idx = (int)g_proc_count;
+        g_procs[idx].pid       = pid;
+        g_procs[idx].window_id = wid;
+        g_procs[idx].state     = PROC_RUNNING;
+        g_procs[idx].exit_code = 0;
+        g_proc_count++;
+
+        printf("[Launcher] Ventana %d lanzada (PID %d)\n", wid, pid);
+        usleep(100000);
+    }
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -209,14 +275,14 @@ static void shutdown_all(void)
  * ════════════════════════════════════════════════════════════════ */
 static void print_menu(void)
 {
-    printf("╔══════════════════════════════╗\n");
-    printf("║      AGENTIC-OS LAUNCHER     ║\n");
-    printf("╠══════════════════════════════╣\n");
-    printf("║  1. Ver estado de procesos   ║\n");
-    printf("║  2. Salir (cierre limpio)    ║\n");
-    printf("╚══════════════════════════════╝\n");
-    printf("Opción: ");
-    fflush(stdout);
+    printf("╔══════════════════════════════════╗\n");
+    printf("║       AGENTIC-OS LAUNCHER        ║\n");
+    printf("╠══════════════════════════════════╣\n");
+    printf("║  1. Ver estado de procesos       ║\n");
+    printf("║  2. Cerrar todas las ventanas    ║\n");
+    printf("║  3. Lanzar N ventanas nuevas     ║\n");
+    printf("║  4. Salir                        ║\n");
+    printf("╚══════════════════════════════════╝\n");
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -262,6 +328,11 @@ int main(int argc, char *argv[])
             client_bin);
         return EXIT_FAILURE;
     }
+
+    /* Guardar en globales para reuso desde launch_more_windows() */
+    g_host       = host;
+    g_port       = port;
+    g_client_bin = client_bin;
 
     /* ── Instalar SIGCHLD ── */
     struct sigaction sa;
@@ -321,7 +392,7 @@ int main(int argc, char *argv[])
         char *opt_end;
         long opt = strtol(input, &opt_end, 10);
         if (opt_end == input || *opt_end != '\0') {
-            printf("Opción inválida. Ingresa 1 o 2.\n\n");
+            printf("Opción inválida. Ingresa 1, 2, 3 o 4.\n\n");
             continue;
         }
 
@@ -330,10 +401,36 @@ int main(int argc, char *argv[])
             print_status();
             break;
         case 2:
+            terminate_all_children();
+            continue;   /* evita el chequeo de auto-salida de abajo */
+        case 3: {
+            int libres = MAX_WINDOWS - (int)g_proc_count;
+            if (libres <= 0) {
+                printf("[Launcher] Ya se alcanzó el máximo de %d ventanas.\n\n",
+                       MAX_WINDOWS);
+                continue;
+            }
+            printf("¿Cuántas ventanas nuevas deseas abrir? (máx %d): ", libres);
+            fflush(stdout);
+
+            char nbuf[32];
+            if (fgets(nbuf, sizeof(nbuf), stdin) == NULL) continue;
+            nbuf[strcspn(nbuf, "\n")] = '\0';
+
+            char *ne;
+            long n = strtol(nbuf, &ne, 10);
+            if (ne == nbuf || *ne != '\0' || n < 1 || n > libres) {
+                printf("[Launcher] Cantidad inválida.\n\n");
+                continue;
+            }
+            launch_more_windows((int)n);
+            continue;   /* evita el chequeo de auto-salida de abajo */
+        }
+        case 4:
             running = 0;
             break;
         default:
-            printf("Opción inválida. Ingresa 1 o 2.\n\n");
+            printf("Opción inválida. Ingresa 1, 2, 3 o 4.\n\n");
             break;
         }
 
