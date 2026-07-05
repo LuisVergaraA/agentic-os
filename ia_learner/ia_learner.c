@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <ctype.h>
+#include <time.h>
 
 #include "../include/common.h"
 
@@ -188,28 +189,27 @@ static void doc_table_mark_done(DocTable *t)
  * Esperar a que todos los documentos declarados por TOTAL terminen.
  * Si TOTAL no llegó aún, esperar a que llegue y luego a que terminen.
  */
-static void doc_table_wait_all(DocTable *t)
+static int doc_table_wait_next_round(DocTable *t, int last_target)
 {
     pthread_mutex_lock(&t->mutex);
-    /*
-     * Esperar la condición correcta según si el Launcher envió TOTAL:
-     *   - Con TOTAL: esperar que finished alcance total_expected
-     *   - Sin TOTAL: esperar al menos 1 doc y que todos terminen
-     * En ambos casos usamos un único cond_wait que se reevalúa
-     * cada vez que algo cambia (registro, finish, o llegada de TOTAL).
-     */
     for (;;) {
-        int target = (int)g_total_expected;
-        if (target > 0) {
-            /* Launcher declaró cuántas ventanas hay */
-            if (t->finished >= target) break;
-        } else {
-            /* sin TOTAL: esperar al menos 1 y que todas terminen */
-            if (t->count > 0 && t->finished >= t->count) break;
+        if (!g_running) {
+            pthread_mutex_unlock(&t->mutex);
+            return 0;
         }
-        pthread_cond_wait(&t->all_done, &t->mutex);
+
+        int target = (int)g_total_expected;
+        if (target > last_target && t->finished >= target)
+            break;
+
+        /* timeout de 1 s para poder revisar g_running periódicamente */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 1;
+        pthread_cond_timedwait(&t->all_done, &t->mutex, &ts);
     }
     pthread_mutex_unlock(&t->mutex);
+    return 1;
 }
 
 static void doc_table_destroy(DocTable *t)
@@ -312,21 +312,29 @@ static UserType infer_user_type(const DocTable *t)
 static void *classifier_thread(void *arg)
 {
     (void)arg;
-    PRINT_LOCK();
-    printf("[IALearner] Clasificador final esperando documentos...\n");
-    PRINT_UNLOCK();
-
-    doc_table_wait_all(&g_table);
-
-    UserType user = infer_user_type(&g_table);
+    int last_target = 0;
 
     PRINT_LOCK();
-    printf("╔══════════════════════════════════════╗\n");
-    printf("║  CONTEXTO DE USUARIO DETECTADO       ║\n");
-    printf("║  -> %-34s║\n", USER_TYPE_NAMES[user]);
-    printf("╚══════════════════════════════════════╝\n\n");
+    printf("[IALearner] Clasificador esperando documentos...\n");
     PRINT_UNLOCK();
 
+    while (doc_table_wait_next_round(&g_table, last_target)) {
+        int target = (int)g_total_expected;
+        UserType user = infer_user_type(&g_table);
+
+        PRINT_LOCK();
+        printf("╔══════════════════════════════════════╗\n");
+        printf("║  CONTEXTO DE USUARIO (%2d ventana(s)) ║\n", target);
+        printf("║  -> %-34s║\n", USER_TYPE_NAMES[user]);
+        printf("╚══════════════════════════════════════╝\n\n");
+        PRINT_UNLOCK();
+
+        last_target = target;
+    }
+
+    PRINT_LOCK();
+    printf("[IALearner] Clasificador detenido.\n");
+    PRINT_UNLOCK();
     return NULL;
 }
 
