@@ -20,7 +20,7 @@ agentic_os/
 ├── ia_learner/
 │   └── ia_learner.c      # Servidor TCP: bag-of-words + clasificación
 └── docs/
-    └── deployment.puml   # Diagrama de despliegue PlantUML
+    └── Agentic-OS_Vergara.pdf   # Reporte de proyecto
 ```
 
 ---
@@ -114,12 +114,9 @@ Cada ventana gráfica captura el texto del usuario en tiempo real:
 | **Backspace** | Borra el último carácter |
 | **Escape** | Cierra la ventana y termina el documento |
 
-> Las palabras se envían **en tiempo real** al presionar espacio,
-> sin necesidad de esperar a que el usuario cierre la ventana.
-
 ---
 
-## Diccionarios bag-of-words (en español)
+## Diccionarios
 
 Un documento se clasifica en una clase si al menos **3 palabras** del
 diccionario aparecen en él. Si hay empate, gana la clase con mayor
