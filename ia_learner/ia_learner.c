@@ -43,25 +43,60 @@ static volatile sig_atomic_t g_total_expected = 0;  /* declarado por TOTAL */
 
 /* ═══════════════════════════════════════════════════════════════
  * DICCIONARIOS BAG-OF-WORDS
+ *
+ * Ya NO están quemados en el código: se cargan en tiempo de
+ * ejecución desde archivos de texto plano (uno por clase, uno por
+ * línea). Esto permite ajustar el vocabulario de clasificación sin
+ * recompilar el servidor.
  * ═══════════════════════════════════════════════════════════════ */
-static const char *DICT_EMAIL[] = {
-    "gracias","favor","saludos","reunion","adjunto",
-    "informacion","actualizar","horario","equipo","proyecto", NULL
+#define MAX_DICT_WORDS 64
+
+/* Rutas relativas al directorio desde donde se ejecuta ./ia_learner */
+static const char *DICT_PATHS[NUM_DOC_CLASSES] = {
+    "dicts/email.txt",
+    "dicts/articulo.txt",
+    "dicts/reporte.txt"
 };
-static const char *DICT_ARTICLE[] = {
-    "datos","analisis","resultados","metodo","estudio",
-    "modelo","investigacion","sistema","significativo","efecto", NULL
-};
-static const char *DICT_REPORT[] = {
-    "sistema","datos","red","seguridad","aplicacion",
-    "servidor","usuario","rendimiento","servicio","infraestructura", NULL
-};
-static const char **DICTIONARIES[NUM_DOC_CLASSES] = {
-    DICT_EMAIL, DICT_ARTICLE, DICT_REPORT
-};
+static char *DICTIONARIES[NUM_DOC_CLASSES][MAX_DICT_WORDS + 1]; /* +1 para NULL final */
 static const char *CLASS_NAMES[NUM_DOC_CLASSES] = {
     "Correo electronico", "Articulo cientifico", "Reporte"
 };
+
+/*
+ * Carga un diccionario desde disco: una palabra por línea, ignorando
+ * líneas vacías y comentarios ("# ..."). Escribe hasta MAX_DICT_WORDS
+ * palabras en 'out' y las termina con NULL (igual que los arreglos
+ * estáticos que reemplaza), para no tener que tocar el resto del
+ * código que ya asume diccionarios NULL-terminados.
+ * Devuelve la cantidad de palabras cargadas, o -1 si no pudo abrir el archivo.
+ */
+static int load_dictionary(const char *path, char *out[MAX_DICT_WORDS + 1])
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[IALearner] No se pudo abrir diccionario '%s': %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    int count = 0;
+    char line[MAX_WORD_LEN];
+    while (count < MAX_DICT_WORDS && fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0' || line[0] == '#') continue;
+        out[count++] = strdup(line);
+    }
+    out[count] = NULL;
+    fclose(f);
+    return count;
+}
+
+static void free_dictionaries(void)
+{
+    for (int c = 0; c < NUM_DOC_CLASSES; c++)
+        for (int i = 0; DICTIONARIES[c][i] != NULL; i++)
+            free(DICTIONARIES[c][i]);
+}
 static const char *USER_TYPE_NAMES[] = {
     "Personal administrativo", "Personal tecnico",
     "Profesor", "Estudiante", "Indeterminado"
@@ -69,15 +104,42 @@ static const char *USER_TYPE_NAMES[] = {
 
 /* ═══════════════════════════════════════════════════════════════
  * TDA: BAG OF WORDS
+ *
+ * Antes: búsqueda lineal (strncmp contra todas las entradas) tanto
+ * para insertar como para consultar frecuencia -> O(n) por palabra.
+ *
+ * Ahora: tabla hash con encadenamiento (hash djb2). 'buckets[h]' guarda
+ * el índice de la primera entrada de esa cubeta, y 'next[i]' enlaza
+ * la siguiente entrada de la misma cubeta (-1 = fin de la lista). Se
+ * usan índices sobre el arreglo fijo 'entries', no punteros ni malloc,
+ * para no meter gestión dinámica de memoria en una estructura que ya
+ * tiene un tamaño máximo acotado (MAX_VOCAB_SIZE) y es compartida
+ * entre hilos. Complejidad promedio: O(1) por inserción/consulta.
  * ═══════════════════════════════════════════════════════════════ */
+#define BOW_HASH_BUCKETS 128
+
 typedef struct {
     WordFreq entries[MAX_VOCAB_SIZE];
+    int      next[MAX_VOCAB_SIZE];        /* enlace dentro de la cubeta   */
+    int      buckets[BOW_HASH_BUCKETS];   /* cabeza de cada cubeta        */
     int      size;
 } BagOfWords;
+
+/* djb2 - hash simple y rápido, suficiente para vocabulario acotado */
+static unsigned int hash_word(const char *s)
+{
+    unsigned int h = 5381;
+    int c;
+    while ((c = (unsigned char)*s++))
+        h = ((h << 5) + h) + (unsigned int)c;   /* h*33 + c */
+    return h % BOW_HASH_BUCKETS;
+}
 
 static void bow_init(BagOfWords *b)
 {
     memset(b, 0, sizeof(BagOfWords));
+    for (int i = 0; i < BOW_HASH_BUCKETS; i++) b->buckets[i] = -1;
+    for (int i = 0; i < MAX_VOCAB_SIZE; i++)   b->next[i]    = -1;
 }
 
 static void to_lower(const char *src, char *dst, size_t n)
@@ -93,16 +155,20 @@ static void bow_add_word(BagOfWords *b, const char *word)
     if (!word || !word[0]) return;
     char low[MAX_WORD_LEN];
     to_lower(word, low, sizeof(low));
-    for (int i = 0; i < b->size; i++) {
+
+    unsigned int h = hash_word(low);
+    for (int i = b->buckets[h]; i != -1; i = b->next[i]) {
         if (strncmp(b->entries[i].word, low, MAX_WORD_LEN) == 0) {
             b->entries[i].count++;
             return;
         }
     }
     if (b->size < MAX_VOCAB_SIZE) {
-        strncpy(b->entries[b->size].word, low, MAX_WORD_LEN - 1);
-        b->entries[b->size].count = 1;
-        b->size++;
+        int idx = b->size++;
+        strncpy(b->entries[idx].word, low, MAX_WORD_LEN - 1);
+        b->entries[idx].count = 1;
+        b->next[idx]  = b->buckets[h];   /* insertar al frente de la cubeta */
+        b->buckets[h] = idx;
     }
 }
 
@@ -110,7 +176,8 @@ static int bow_get_freq(const BagOfWords *b, const char *word)
 {
     char low[MAX_WORD_LEN];
     to_lower(word, low, sizeof(low));
-    for (int i = 0; i < b->size; i++)
+    unsigned int h = hash_word(low);
+    for (int i = b->buckets[h]; i != -1; i = b->next[i])
         if (strncmp(b->entries[i].word, low, MAX_WORD_LEN) == 0)
             return b->entries[i].count;
     return 0;
@@ -157,23 +224,40 @@ static void doc_table_init(DocTable *t)
 
 static DocRecord *doc_table_register(DocTable *t, int window_id)
 {
+    /* Sección crítica MÍNIMA: lo único que toca memoria realmente
+     * compartida entre hilos es el flag in_use[] de la tabla, así que
+     * es lo único que se busca/reserva bajo el mutex. */
+    int found_index = -1;
     pthread_mutex_lock(&t->mutex);
-    DocRecord *slot = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (!t->docs[i].in_use) {
-            slot = &t->docs[i];
-            slot->in_use         = 1;
-            slot->window_id      = window_id;
-            slot->doc_class      = DOC_UNKNOWN;
-            slot->current_line[0] = '\0';
-            bow_init(&slot->bow);
-            t->count++;
-            /* despertar al clasificador: ya hay al menos 1 doc */
-            pthread_cond_signal(&t->all_done);
+            t->docs[i].in_use = 1;   /* reserva atómica del slot */
+            found_index = i;
             break;
         }
     }
     pthread_mutex_unlock(&t->mutex);
+
+    if (found_index == -1)
+        return NULL;   /* tabla llena */
+
+    /* Inicialización del slot ya reservado: NO necesita el mutex porque
+     * in_use == 1 garantiza que ningún otro hilo va a tocar este slot
+     * (doc_table_register no lo va a reasignar, y todavía no lo conoce
+     * ningún otro hilo: window_id/doc_class se publican recién aquí). */
+    DocRecord *slot = &t->docs[found_index];
+    slot->window_id       = window_id;
+    slot->doc_class       = DOC_UNKNOWN;
+    slot->current_line[0] = '\0';
+    bow_init(&slot->bow);
+
+    /* Segunda sección crítica, corta: actualizar el contador compartido
+     * y despertar al clasificador (ya hay al menos 1 doc registrado). */
+    pthread_mutex_lock(&t->mutex);
+    t->count++;
+    pthread_cond_signal(&t->all_done);
+    pthread_mutex_unlock(&t->mutex);
+
     return slot;
 }
 
@@ -223,7 +307,7 @@ static void doc_table_destroy(DocTable *t)
 /* ═══════════════════════════════════════════════════════════════
  * CLASIFICADOR BAG-OF-WORDS
  * ═══════════════════════════════════════════════════════════════ */
-static int score_class(const BagOfWords *b, const char **dict, int *matches)
+static int score_class(const BagOfWords *b, char *const *dict, int *matches)
 {
     int freq = 0, m = 0;
     for (int i = 0; dict[i]; i++) {
@@ -497,6 +581,22 @@ int main(int argc, char *argv[])
     signal(SIGINT,  handle_sigint);
     signal(SIGPIPE, SIG_IGN);
 
+    /* Cargar diccionarios BOW desde disco (carpeta dicts/) antes de
+     * aceptar cualquier conexión. Si falta alguno, se aborta con un
+     * mensaje claro en vez de arrancar con un clasificador vacío. */
+    for (int c = 0; c < NUM_DOC_CLASSES; c++) {
+        int n = load_dictionary(DICT_PATHS[c], DICTIONARIES[c]);
+        if (n <= 0) {
+            fprintf(stderr,
+                "[IALearner] Diccionario '%s' vacio o no encontrado.\n"
+                "[IALearner] Verifique que la carpeta 'dicts/' exista junto al ejecutable.\n",
+                DICT_PATHS[c]);
+            return EXIT_FAILURE;
+        }
+        printf("[IALearner] Diccionario '%s' cargado: %d palabra(s) (%s)\n",
+               DICT_PATHS[c], n, CLASS_NAMES[c]);
+    }
+
     doc_table_init(&g_table);
 
     /* Hilo clasificador final — joined en main para garantizar output */
@@ -560,6 +660,7 @@ int main(int argc, char *argv[])
     close(server_fd);
     pthread_join(clf_tid, NULL);   /* esperar resultado final antes de salir */
     doc_table_destroy(&g_table);
+    free_dictionaries();
 
     printf("[IALearner] Servidor detenido.\n");
     return EXIT_SUCCESS;

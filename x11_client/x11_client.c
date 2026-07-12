@@ -33,7 +33,7 @@
 typedef struct {
     char   items[QUEUE_CAP][MSG_MAX_LEN];
     int    head, tail, count;
-    int    done;                  /* 1 = no llegan más mensajes     */
+    int    done;                
     pthread_mutex_t mtx;
     pthread_cond_t  not_empty;
     pthread_cond_t  not_full;
@@ -330,12 +330,6 @@ int main(int argc, char *argv[])
         /* marcar fin de oración implícito al cerrar */
         queue_push(&g_ctx.queue, MSG_PREFIX_NEWLINE);
     }
-
-    /* ORDEN CRÍTICO:
-     * 1. queue_close + pthread_join PRIMERO — garantiza que el hilo
-     *    envía todos los mensajes pendientes antes de cerrar el socket.
-     * 2. shutdown + close del socket — el servidor detecta recv()==0.
-     * 3. XCloseDisplay AL FINAL — evita que X11 bloquee el cierre TCP. */
 
     queue_close(&g_ctx.queue);
     pthread_join(tid, NULL);

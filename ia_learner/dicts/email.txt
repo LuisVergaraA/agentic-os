@@ -1,0 +1,11 @@
+# Diccionario BOW - clase: Correo electronico
+gracias
+favor
+saludos
+reunion
+adjunto
+informacion
+actualizar
+horario
+equipo
+proyecto

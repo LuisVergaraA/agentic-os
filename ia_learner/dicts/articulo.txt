@@ -1,0 +1,11 @@
+# Diccionario BOW - clase: Articulo cientifico
+datos
+analisis
+resultados
+metodo
+estudio
+modelo
+investigacion
+sistema
+significativo
+efecto

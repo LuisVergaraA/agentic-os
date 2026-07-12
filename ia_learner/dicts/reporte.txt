@@ -1,0 +1,11 @@
+# Diccionario BOW - clase: Reporte
+sistema
+datos
+red
+seguridad
+aplicacion
+servidor
+usuario
+rendimiento
+servicio
+infraestructura
